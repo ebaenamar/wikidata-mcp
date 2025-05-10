@@ -5,6 +5,9 @@ This module provides functions for interacting with the Wikidata API and SPARQL 
 """
 import json
 import requests
+import traceback
+
+# Import SPARQLWrapper
 from SPARQLWrapper import SPARQLWrapper, JSON
 
 # Constants
@@ -158,30 +161,40 @@ def execute_sparql(sparql_query: str) -> str:
     Returns:
         JSON-formatted result of the query
     """
-    sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
-    sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
-    
-    # Add common prefixes to make queries easier to write
-    prefixes = """
-    PREFIX wd: <http://www.wikidata.org/entity/>
-    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-    PREFIX p: <http://www.wikidata.org/prop/>
-    PREFIX ps: <http://www.wikidata.org/prop/statement/>
-    PREFIX wikibase: <http://wikiba.se/ontology#>
-    PREFIX bd: <http://www.bigdata.com/rdf#>
-    """
-    
-    # Add prefixes if they're not already in the query
-    if not any(prefix in sparql_query for prefix in ["PREFIX", "prefix"]):
-        full_query = prefixes + sparql_query
-    else:
-        full_query = sparql_query
-    
-    sparql.setQuery(full_query)
-    sparql.setReturnFormat(JSON)
-    
     try:
+        sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
+        sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
+        
+        # Add common prefixes to make queries easier to write
+        prefixes = """
+        PREFIX wd: <http://www.wikidata.org/entity/>
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX p: <http://www.wikidata.org/prop/>
+        PREFIX ps: <http://www.wikidata.org/prop/statement/>
+        PREFIX wikibase: <http://wikiba.se/ontology#>
+        PREFIX bd: <http://www.bigdata.com/rdf#>
+        """
+        
+        # Add prefixes if they're not already in the query
+        if not any(prefix in sparql_query for prefix in ["PREFIX", "prefix"]):
+            full_query = prefixes + sparql_query
+        else:
+            full_query = sparql_query
+        
+        sparql.setQuery(full_query)
+        sparql.setReturnFormat(JSON)
+        
         results = sparql.query().convert()
-        return json.dumps(results["results"]["bindings"])
+        # Return the full results structure, not just the bindings
+        return json.dumps(results)
     except Exception as e:
-        return json.dumps({"error": f"Error executing query: {str(e)}"})
+        error_details = {
+            "error": f"Error executing query: {str(e)}",
+            "query": sparql_query,
+            "error_type": str(type(e).__name__),
+            "traceback": traceback.format_exc()
+        }
+        print(f"SPARQL Error Details: {json.dumps(error_details, indent=2)}")
+        return json.dumps(error_details)
+
+

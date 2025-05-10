@@ -19,8 +19,9 @@ A Model Context Protocol (MCP) server with Server-Sent Events (SSE) transport th
 
 The server is deployed and accessible at:
 
-- **URL**: [https://wikidata-mcp.onrender.com](https://wikidata-mcp.onrender.com)
-- **SSE Endpoint**: [https://wikidata-mcp.onrender.com/sse](https://wikidata-mcp.onrender.com/sse)
+- **URL**: [https://wikidata-mcp-mirror.onrender.com](https://wikidata-mcp-mirror.onrender.com)
+- **SSE Endpoint**: [https://wikidata-mcp-mirror.onrender.com/messages/](https://wikidata-mcp-mirror.onrender.com/messages/)
+- **Health Check**: [https://wikidata-mcp-mirror.onrender.com/health](https://wikidata-mcp-mirror.onrender.com/health)
 
 ## Usage with Claude Desktop
 
@@ -38,7 +39,7 @@ To use this server with Claude Desktop:
        "Wikidata Knowledge Remote": {
          "command": "mcp-remote",
          "args": [
-           "https://wikidata-mcp.onrender.com/sse"
+           "https://wikidata-mcp-mirror.onrender.com/messages/"
          ]
        }
      }
@@ -94,17 +95,17 @@ Or manually with curl:
 
 ```bash
 # Connect to SSE endpoint
-curl -N -H "Accept: text/event-stream" https://wikidata-mcp.onrender.com/sse
+curl -N -H "Accept: text/event-stream" https://wikidata-mcp-mirror.onrender.com/messages/
 
 # Send a message (replace SESSION_ID with the one received from the SSE endpoint)
-curl -X POST "https://wikidata-mcp.onrender.com/messages/?session_id=YOUR_SESSION_ID" \
+curl -X POST "https://wikidata-mcp-mirror.onrender.com/messages/?session_id=YOUR_SESSION_ID" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.1.0"}},"id":0}'
 ```
 
-## Deployment on Render
+## Deployment on Render.com
 
-The server is configured for deployment on Render.com using the `render.yaml` file. 
+This server is configured for deployment on Render.com using the `render.yaml` file.
 
 ### Deployment Configuration
 
@@ -113,9 +114,10 @@ The server is configured for deployment on Render.com using the `render.yaml` fi
 - **Environment Variables**:
   - `PORT`: 10000
 - **Health Check Path**: `/health`
-- **Headers**:
-  - `Cache-Control`: no-cache
-  - `Connection`: keep-alive
+
+### Docker Support
+
+The repository includes a Dockerfile that's used by Render.com for containerized deployment. This allows the server to run in a consistent environment with all dependencies properly installed.
 
 ### How to Deploy
 
@@ -124,6 +126,8 @@ The server is configured for deployment on Render.com using the `render.yaml` fi
 3. Connect your GitHub repository
 4. Render will automatically detect the `render.yaml` file and configure the deployment
 5. Click "Create Web Service"
+
+After deployment, you can access your server at the URL provided by Render.com.
 
 ## Architecture
 
@@ -139,6 +143,7 @@ The server is built using:
 - `server_sse.py`: Main server implementation with SSE transport
 - `wikidata_api.py`: Functions for interacting with Wikidata's API and SPARQL endpoint
 - `requirements.txt`: Dependencies for the project
+- `Dockerfile`: Container configuration for Docker deployment on Render
 - `render.yaml`: Configuration for deployment on Render.com
 - `test_mcp_client.py`: Test client for verifying server functionality
 

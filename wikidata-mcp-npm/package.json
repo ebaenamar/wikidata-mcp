@@ -1,0 +1,19 @@
+{
+  "name": "wikidata-mcp",
+  "version": "1.0.0",
+  "description": "Wikidata MCP Client for Goose and Claude Desktop",
+  "bin": {
+    "wikidata-mcp": "./bin/wikidata-mcp.js"
+  },
+  "dependencies": {
+    "mcp-remote": "^0.1.2"
+  },
+  "keywords": ["mcp", "wikidata", "goose", "claude", "ai"],
+  "author": "E. Baena",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ebaenamar/wikidata-mcp.git"
+  },
+  "homepage": "https://github.com/ebaenamar/wikidata-mcp#readme"
+}
