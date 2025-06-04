@@ -10,6 +10,7 @@ import asyncio
 import anyio
 import uvicorn
 import traceback
+import re
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -45,7 +46,20 @@ def search_wikidata_entity(query: str) -> str:
     Returns:
         The Wikidata entity ID (e.g., Q937) or an error message
     """
-    return search_entity(query)
+    result = search_entity(query)
+    if isinstance(result, str) and result.startswith("Error searching for entity:"):
+        return json.dumps({
+            "error": "Failed to search Wikidata entity.",
+            "details": result,
+            "suggestion": "Check your network connection or try a different search query."
+        })
+    if result == "No entity found":
+        return json.dumps({
+            "error": "No entity found on Wikidata.",
+            "details": f"The query '{query}' did not return any results.",
+            "suggestion": "Try alternative spellings, more general or specific terms, or ensure the entity exists on Wikidata."
+        })
+    return result # Expected to be an entity ID string if successful
 
 @mcp.tool()
 def search_wikidata_property(query: str) -> str:
@@ -58,7 +72,20 @@ def search_wikidata_property(query: str) -> str:
     Returns:
         The Wikidata property ID (e.g., P31) or an error message
     """
-    return search_property(query)
+    result = search_property(query)
+    if isinstance(result, str) and result.startswith("Error searching for property:"):
+        return json.dumps({
+            "error": "Failed to search Wikidata property.",
+            "details": result,
+            "suggestion": "Check your network connection or try a different search query."
+        })
+    if result == "No property found":
+        return json.dumps({
+            "error": "No property found on Wikidata.",
+            "details": f"The query '{query}' did not return any results for a property.",
+            "suggestion": "Try alternative spellings, or ensure the property exists on Wikidata (e.g., check common properties list)."
+        })
+    return result # Expected to be a property ID string if successful
 
 @mcp.tool()
 def get_wikidata_metadata(entity_id: str) -> str:
@@ -72,6 +99,12 @@ def get_wikidata_metadata(entity_id: str) -> str:
         JSON string containing the entity's label and description
     """
     metadata = get_entity_metadata(entity_id)
+    if isinstance(metadata, dict) and "error" in metadata:
+        return json.dumps({
+            "error": f"Failed to get metadata for entity ID '{entity_id}'.",
+            "details": metadata["error"],
+            "suggestion": "The entity ID might be invalid, the entity may not exist, or there could be an issue with the metadata service."
+        })
     return json.dumps(metadata)
 
 @mcp.tool()
@@ -85,8 +118,42 @@ def get_wikidata_properties(entity_id: str) -> str:
     Returns:
         JSON string containing the entity's properties and their values
     """
-    properties = get_entity_properties(entity_id)
-    return json.dumps(properties)
+    # get_entity_properties calls execute_sparql internally.
+    # The execute_sparql in wikidata_api.py now returns detailed JSON errors.
+    # This tool calls wikidata_api.get_entity_properties, which in turn calls wikidata_api.execute_sparql
+    # So, we need to handle the JSON string that might be an error.
+
+    properties_json_str = get_entity_properties(entity_id)
+    try:
+        properties_data = json.loads(properties_json_str)
+
+        # Check if the parsed data itself is an error structure from execute_sparql
+        if isinstance(properties_data, dict) and 'error' in properties_data and 'error_type' in properties_data:
+            # This is an error from execute_sparql, propagated by get_entity_properties
+            error_type = properties_data.get('error_type')
+            suggestion = "Review the error details. If it's a query issue, the default query for properties might be failing for this entity."
+            if error_type == "QueryBadFormed":
+                suggestion = "The underlying SPARQL query for fetching properties might be malformed (unlikely for default queries) or there's an issue with the entity ID affecting the query."
+            elif error_type == "Timeout" or error_type == "ConnectionError" or error_type == "MaxRetriesExceeded":
+                suggestion = "Fetching properties failed due to network issues or timeout. Please try again later."
+
+            return json.dumps({
+                "error": f"Failed to get properties for entity ID '{entity_id}'.",
+                "details": properties_data.get('error'),
+                "error_type": error_type,
+                "original_query": properties_data.get('query'),
+                "suggestion": suggestion
+            })
+        # If not an error from execute_sparql, assume it's the actual properties data or a simpler error from get_entity_properties itself
+        return properties_json_str # Return the original JSON string which might be data or a simple error
+
+    except json.JSONDecodeError:
+        # This means get_entity_properties returned something that was not JSON at all.
+        return json.dumps({
+            "error": "Received non-JSON response when fetching entity properties.",
+            "details": properties_json_str, # Show what was received
+            "suggestion": "This indicates an unexpected response format from the properties retrieval function."
+        })
 
 @mcp.tool("execute_wikidata_sparql")
 def execute_wikidata_sparql(sparql_query: str) -> str:
@@ -99,51 +166,69 @@ def execute_wikidata_sparql(sparql_query: str) -> str:
     Returns:
         The results of the SPARQL query.
     """
+    validation_result = _validate_sparql_query(sparql_query)
+    if not validation_result["is_valid"]:
+        return json.dumps({
+            "error": "SPARQL query validation failed",
+            "details": validation_result["error"],
+            "suggestion": validation_result["suggestion"]
+        })
+
     try:
-        # Validate the query for common syntax errors
-        if '"' in sparql_query and not sparql_query.count('"') % 2 == 0:
-            return json.dumps({"error": "Unbalanced double quotes in SPARQL query"})
-        
-        if "'" in sparql_query and not sparql_query.count("'") % 2 == 0:
-            return json.dumps({"error": "Unbalanced single quotes in SPARQL query"})
-        
-        # Check for common syntax issues with FILTER
-        if 'FILTER(' in sparql_query and 'CONTAINS' in sparql_query:
-            # Check for potential issues with quotes in CONTAINS
-            if 'CONTAINS(str(' in sparql_query and '")' in sparql_query:
-                return json.dumps({"error": "Possible quote issue in CONTAINS. Use single quotes inside double quotes or escape properly."})
-        
         # Use the imported execute_sparql function from wikidata_api.py
-        result = execute_sparql(sparql_query)
+        raw_result = execute_sparql(sparql_query)
         
-        # Convert the result to a dictionary if it's a string (JSON)
-        if isinstance(result, str):
-            try:
-                result_dict = json.loads(result)
-                
-                # Check if the result contains an error
-                if isinstance(result_dict, dict) and 'error' in result_dict:
-                    print(f"SPARQL Query Error: {result_dict}")
-                    
-                    # Enhanced error message with query details
-                    error_msg = result_dict.get('error', 'Unknown error')
-                    error_type = result_dict.get('error_type', 'Unknown error type')
-                    query = result_dict.get('query', 'Query not available')
-                    
-                    # Return a more user-friendly error message as JSON string
-                    return json.dumps({
-                        "error": error_msg,
-                        "details": f"Error Type: {error_type}\nQuery: {query}",
-                        "suggestion": "Try simplifying your query or check for syntax errors."
-                    })
-                
-                # Return the result dictionary as a JSON string
-                return result
-            except json.JSONDecodeError:
-                return json.dumps({"result": result})
-        # The result is already a JSON string from execute_sparql
-        return result
+        # Attempt to parse the result as JSON
+        try:
+            result_data = json.loads(raw_result)
+        except json.JSONDecodeError:
+            # If it's not JSON, it might be a raw non-JSON error string (less likely from current wikidata_api)
+            # or a successful result that's not JSON (also unlikely for SPARQL results)
+            return json.dumps({
+                "error": "Received non-JSON response from SPARQL execution.",
+                "details": raw_result,
+                "suggestion": "Check the SPARQL endpoint or the API's response format."
+            })
+
+        # Check if the parsed result contains an error from wikidata_api.py
+        if isinstance(result_data, dict) and 'error' in result_data and 'error_type' in result_data:
+            error_msg = result_data.get('error', 'Unknown error from wikidata_api')
+            error_type = result_data.get('error_type', 'UnknownErrorType')
+            original_query = result_data.get('query', sparql_query) # Fallback to input query
+            # traceback_info = result_data.get('traceback', 'No traceback available.') # Keep traceback internal for now
+
+            suggestion = "Please review your query and the error details."
+
+            if error_type == "QueryBadFormed":
+                suggestion = "The SPARQL query syntax is incorrect. Please check for typos, keyword misuse, or structural issues. Refer to SPARQL documentation or use a SPARQL validator for assistance."
+            elif error_type == "Timeout":
+                suggestion = "The query execution timed out. Try simplifying the query, adding or adjusting LIMIT/OFFSET clauses, or reducing its complexity. Executing it at a later time might also help."
+            elif error_type == "ConnectionError":
+                suggestion = "A network connection error occurred while trying to reach the SPARQL endpoint. Please check your internet connection and try again later."
+            elif error_type == "MaxRetriesExceeded":
+                original_error_type = result_data.get('original_error_type', 'transient issues')
+                suggestion = f"The query failed after multiple retries due to repeated '{original_error_type}'. This could be due to network issues or endpoint overload. Try again later. Original error: {error_msg}"
+            elif "Error executing query" in error_msg: # General catch from wikidata_api if error_type was not more specific
+                suggestion = "An error occurred during query execution. Check the syntax and ensure all identifiers (URIs, variables) are correct."
+
+            # Log the full error for server-side diagnosis
+            print(f"SPARQL Query Error (from execute_wikidata_sparql tool): {json.dumps(result_data)}")
+
+            return json.dumps({
+                "error": "SPARQL query execution failed.",
+                "original_error_message": error_msg,
+                "error_type": error_type,
+                "query": original_query,
+                "suggestion": suggestion
+                # "traceback": traceback_info # Exposing traceback to client is optional, often better to keep server-side
+            })
+
+        # If no 'error' key with 'error_type', assume success and return the raw_result (which is a JSON string)
+        return raw_result
+
     except Exception as e:
+        # This catches errors from the execute_sparql call itself if it raises an exception
+        # before returning a JSON error string (e.g., programming error in this tool, not from wikidata_api)
         error_message = str(e)
         print(f"Exception in execute_wikidata_sparql: {error_message}")
         
@@ -151,6 +236,174 @@ def execute_wikidata_sparql(sparql_query: str) -> str:
         if "Lexical error" in error_message and "Encountered: " in error_message:
             return json.dumps({"error": f"SPARQL syntax error: {error_message}. Check for unescaped quotes or special characters."})
         return json.dumps({"error": f"Error executing SPARQL query: {error_message}"})
+
+# Helper function for SPARQL validation
+def _validate_sparql_query(query: str) -> dict:
+    """
+    Validates a SPARQL query for common syntax issues.
+
+    Args:
+        query: The SPARQL query string.
+
+    Returns:
+        A dictionary with "is_valid": True, or "is_valid": False
+        and error/suggestion messages.
+    """
+    # 1. Check for unbalanced parentheses, brackets, and curly braces
+    brackets_map = {"(": ")", "[": "]", "{": "}"}
+    open_brackets = []
+    for char in query:
+        if char in brackets_map:
+            open_brackets.append(char)
+        elif char in brackets_map.values():
+            if not open_brackets or brackets_map[open_brackets.pop()] != char:
+                return {
+                    "is_valid": False,
+                    "error": f"Unbalanced closing bracket/parenthesis/brace: '{char}'",
+                    "suggestion": "Ensure all opening brackets, parentheses, and braces have a matching closing one in the correct order."
+                }
+    if open_brackets:
+        return {
+            "is_valid": False,
+            "error": f"Unclosed opening bracket/parenthesis/brace: '{open_brackets[-1]}'",
+            "suggestion": "Ensure all opening brackets, parentheses, and braces are closed."
+        }
+
+    # 2. Validate common keywords (case-insensitive)
+    # SELECT keyword
+    if re.search(r"SELECT\s*(?![?*\w(])", query, re.IGNORECASE):
+        return {
+            "is_valid": False,
+            "error": "Invalid SELECT clause.",
+            "suggestion": "SELECT keyword should be followed by variables (e.g., ?var), '*', or aggregate functions (e.g., COUNT(?var))."
+        }
+
+    # WHERE keyword
+    if re.search(r"WHERE\s*(?!\{)", query, re.IGNORECASE) and not re.search(r"WHERE\s*DATA\s*\{", query, re.IGNORECASE) :
+         # The second part of the condition is to allow WHERE DATA { ... }
+        return {
+            "is_valid": False,
+            "error": "Invalid WHERE clause.",
+            "suggestion": "WHERE keyword should be followed by a graph pattern enclosed in curly braces {} (e.g., WHERE { ?s ?p ?o . })."
+        }
+    if "WHERE" in query and not (query.count("{") >= query.count("WHERE") and query.count("}") >= query.count("WHERE")):
+        # Basic check, might need refinement for complex queries with nested blocks
+        # This is a simplified check. A proper parser would be needed for full accuracy.
+        pass # Covered by general brace checking, but good to keep in mind.
+
+    # PREFIX keyword
+    if re.search(r"PREFIX\s+\w*:\s*(?!<)", query, re.IGNORECASE):
+        return {
+            "is_valid": False,
+            "error": "Invalid PREFIX declaration.",
+            "suggestion": "PREFIX declarations should use URIs enclosed in < > (e.g., PREFIX foaf: <http://xmlns.com/foaf/0.1/>)."
+        }
+    if re.search(r"PREFIX\s+\w*:\s*<[^>]*$", query, re.IGNORECASE): # Missing closing >
+        return {
+            "is_valid": False,
+            "error": "Incomplete URI in PREFIX declaration.",
+            "suggestion": "Ensure URIs in PREFIX declarations are properly closed with '>'."
+        }
+
+    # FILTER keyword
+    # Check for FILTER NOT EXISTS { ... } or FILTER EXISTS { ... } - these are valid
+    if re.search(r"FILTER\s*\((?!\s*(NOT\s+EXISTS|EXISTS)\s*\{)", query, re.IGNORECASE):
+        # This regex checks for FILTER (...) but excludes FILTER (EXISTS {...}) and FILTER (NOT EXISTS {...})
+        # It aims to find filters that should have content inside the parentheses.
+        if re.search(r"FILTER\s*\(\s*\)", query, re.IGNORECASE): # Empty FILTER ()
+            return {
+                "is_valid": False,
+                "error": "Empty FILTER clause.",
+                "suggestion": "FILTER clauses must contain an expression (e.g., FILTER(?age > 18))."
+            }
+        # Check for common issues like missing operators or operands if not an EXISTS/NOT EXISTS
+        # Example: FILTER(?x = ) or FILTER( = ?y) or FILTER(?x >)
+        if re.search(r"FILTER\s*\([^)]*[=<>!]+\s*\)", query, re.IGNORECASE) or \
+           re.search(r"FILTER\s*\([^)]*\s*[=<>!]+\s*[^)\w?\"']", query, re.IGNORECASE): # Operand missing after operator
+             pass # This is complex to get right with regex, can lead to false positives.
+                  # The QueryBadFormed exception from SPARQLWrapper is often better for these.
+
+    # LIMIT / OFFSET keywords
+    if re.search(r"(LIMIT|OFFSET)\s+(?!\d+)", query, re.IGNORECASE):
+        return {
+            "is_valid": False,
+            "error": "Invalid LIMIT or OFFSET clause.",
+            "suggestion": "LIMIT and OFFSET keywords must be followed by a non-negative integer."
+        }
+
+    # ORDER BY keyword
+    if re.search(r"ORDER\s+BY\s+(?!(ASC|DESC)\s*\(|\?\w+|IRI|STR|LANG|DATATYPE)", query, re.IGNORECASE):
+        return {
+            "is_valid": False,
+            "error": "Invalid ORDER BY clause.",
+            "suggestion": "ORDER BY should be followed by a variable (e.g., ?name), or a function call like ASC(?date) or DESC(?value)."
+        }
+
+    # GROUP BY keyword
+    if re.search(r"GROUP\s+BY\s+(?!\?\w+)", query, re.IGNORECASE):
+        return {
+            "is_valid": False,
+            "error": "Invalid GROUP BY clause.",
+            "suggestion": "GROUP BY should be followed by one or more variables (e.g., GROUP BY ?type)."
+        }
+
+    # 3. Check for potentially problematic characters or patterns
+    # Example: Unescaped quotes within strings if not handled by bracket checker
+    # This is tricky with regex. The SPARQL parser itself is the best validator here.
+    # However, we can check for some obvious cases.
+
+    # Check for an odd number of quotes (could indicate unclosed string literals)
+    # This is a simplified check and might not cover all edge cases (e.g., escaped quotes within strings)
+    if query.count('"') % 2 != 0:
+        # Further check if it's part of a lang tag or datatype
+        if not re.search(r'@[a-zA-Z]{2,}(?:-[a-zA-Z0-9]+)*\s*(")', query) and not re.search(r'\^\^<[^>]*>\s*(")', query):
+             # Check if the quote is inside a comment
+            clean_query_for_quotes = re.sub(r"#.*$", "", query, flags=re.MULTILINE) # Remove comments
+            if clean_query_for_quotes.count('"') % 2 != 0:
+                return {
+                    "is_valid": False,
+                    "error": "Unbalanced double quotes.",
+                    "suggestion": "Ensure all string literals using double quotes are properly opened and closed. Escape internal quotes if necessary (e.g., \\\" )."
+                }
+
+    if query.count("'") % 2 != 0:
+        clean_query_for_quotes = re.sub(r"#.*$", "", query, flags=re.MULTILINE) # Remove comments
+        if clean_query_for_quotes.count("'") % 2 != 0:
+            return {
+                "is_valid": False,
+                "error": "Unbalanced single quotes.",
+                "suggestion": "Ensure all string literals using single quotes are properly opened and closed. Escape internal quotes if necessary (e.g., \\' )."
+            }
+
+    # Check for common triple pattern mistakes like missing dots (heuristic)
+    # This is a very basic heuristic and might not be perfectly accurate.
+    # It looks for lines ending with a variable/literal that are likely part of a triple pattern but miss a dot.
+    # Needs to be careful about not flagging lines ending with { or ( or prefixes etc.
+    lines = query.splitlines()
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+        # Check if line seems like a triple but doesn't end with '.', ';', ',', '{', or '}'
+        # and is not a PREFIX, BASE, SELECT, etc.
+        if stripped_line and not stripped_line.endswith(('.', ';', ',', '{', '}')) \
+           and not stripped_line.lower().startswith(("prefix", "base", "select", "construct", "describe", "ask", "#", "optional", "filter", "minus", "graph", "service", "bind", "values", "limit", "offset", "order by", "group by", "having")) \
+           and (re.search(r"(\?\w+|\w+:\w+|\"[^\"]*\"|\'[^\']*\')\s*$", stripped_line)):
+            # Check if the next non-empty line starts with a variable or keyword that would typically start a new triple pattern
+            if i + 1 < len(lines):
+                next_stripped_line = lines[i+1].strip()
+                if next_stripped_line and (next_stripped_line.startswith("?") or next_stripped_line.lower().split(" ")[0] in ["filter", "optional", "minus", "bind", "values", "graph", "service"]):
+                     # This is a potential missing dot if the current line is part of a triple pattern
+                     # However, it could also be a list or part of a complex path expression.
+                     # This rule is prone to false positives, so disabling for now.
+                     # return {
+                     # "is_valid": False,
+                     # "error": f"Potential missing dot '.' or other separator at the end of a triple pattern.",
+                     # "suggestion": f"Check line: '{stripped_line}'. Triple patterns usually end with a dot (.), semicolon (;), or comma (,)."
+                     # }
+                    pass
+
+
+    return {"is_valid": True}
+
 
 @mcp.tool()
 def find_entity_facts(entity_name: str, property_name: str = None) -> str:
@@ -164,23 +417,48 @@ def find_entity_facts(entity_name: str, property_name: str = None) -> str:
     Returns:
         A JSON string containing the entity facts
     """
-    # Search for the entity
-    entity_id = search_entity(entity_name)
-    if entity_id == "No entity found":
-        return json.dumps({"error": f"No entity found for '{entity_name}'"})
-    
-    # Get metadata
-    metadata = get_entity_metadata(entity_id)
-    
-    # If a property is specified, search for it
+    # Search for the entity (using the already improved search_wikidata_entity tool)
+    entity_id_json_str = search_wikidata_entity(entity_name)
+    try:
+        entity_id_data = json.loads(entity_id_json_str)
+        if isinstance(entity_id_data, dict) and "error" in entity_id_data:
+            return entity_id_json_str # Propagate error from search_wikidata_entity
+        entity_id = entity_id_json_str # If not a dict with error, it's the ID string
+    except json.JSONDecodeError:
+        # search_wikidata_entity should return entity ID string or JSON error string
+        entity_id = entity_id_json_str # Assume it's the ID string
+
+    # Get metadata (using the already improved get_wikidata_metadata tool)
+    metadata_json_str = get_wikidata_metadata(entity_id)
+    try:
+        metadata = json.loads(metadata_json_str)
+        if isinstance(metadata, dict) and "error" in metadata:
+             # Augment with context if needed, or just propagate
+            metadata["context"] = f"Error fetching metadata for entity '{entity_name}' (ID: {entity_id})."
+            return json.dumps(metadata)
+    except json.JSONDecodeError:
+        return json.dumps({
+            "error": "Failed to parse metadata response.",
+            "details": metadata_json_str,
+            "suggestion": "Metadata service might have returned an unexpected format."
+        })
+
+    # If a property is specified, search for it (using the already improved search_wikidata_property tool)
     property_id = None
     if property_name:
-        property_id = search_property(property_name)
-        if property_id == "No property found":
-            return json.dumps({
-                "entity": metadata,
-                "error": f"No property found for '{property_name}'"
-            })
+        property_id_json_str = search_wikidata_property(property_name)
+        try:
+            property_id_data = json.loads(property_id_json_str)
+            if isinstance(property_id_data, dict) and "error" in property_id_data:
+                # Property search failed, return error with entity context
+                return json.dumps({
+                    "entity_found": metadata, # Provide context of what was found
+                    "error_searching_property": property_id_data,
+                    "suggestion": f"Could not find property '{property_name}' while looking up facts for '{entity_name}'."
+                })
+            property_id = property_id_json_str # If not a dict with error, it's the ID string
+        except json.JSONDecodeError:
+            property_id = property_id_json_str # Assume it's the ID string
     
     # Build and execute SPARQL query
     if property_id:
@@ -195,30 +473,39 @@ def find_entity_facts(entity_name: str, property_name: str = None) -> str:
     else:
         # General entity info query
         sparql_query = f"""
+        # General entity info: Fetch core data then labels for efficiency.
         SELECT ?property ?propertyLabel ?value ?valueLabel
         WHERE {{
-          wd:{entity_id} ?p ?statement.
-          ?statement ?ps ?value.
-          
-          ?property wikibase:claim ?p.
-          ?property wikibase:statementProperty ?ps.
-          
+          {{
+            SELECT ?property ?value
+            WHERE {{
+              wd:{entity_id} ?p ?statement.
+              ?statement ?ps ?value.
+
+              ?property wikibase:claim ?p.
+              ?property wikibase:statementProperty ?ps.
+            }}
+            LIMIT 10
+          }}
           SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
         }}
-        LIMIT 10
         """
     
-    # Get facts using the execute_sparql function
-    facts = execute_sparql(sparql_query)
+    # Get facts using the tool's execute_wikidata_sparql which has enhanced error handling
+    facts_json_str = execute_wikidata_sparql(sparql_query)
     
-    # Handle the facts based on its type
-    if isinstance(facts, str):
-        try:
-            facts_data = json.loads(facts)
-        except json.JSONDecodeError:
-            facts_data = {"raw": facts}
-    else:
-        facts_data = facts
+    try:
+        facts_data = json.loads(facts_json_str)
+        # If facts_data contains an error (already processed by execute_wikidata_sparql),
+        # it will be propagated as is. This is desired.
+    except json.JSONDecodeError:
+        # This should ideally not happen if execute_wikidata_sparql always returns valid JSON
+        return json.dumps({
+            "error": "Failed to parse SPARQL result from internal call to execute_wikidata_sparql.",
+            "details": "The response from execute_wikidata_sparql was not valid JSON.",
+            "context": {"entity_id": entity_id, "property_id": property_id, "query": sparql_query},
+            "suggestion": "This indicates an internal issue with the server's SPARQL execution tool chain."
+        })
     
     # Combine all results
     result = {
@@ -256,33 +543,41 @@ def get_related_entities(entity_id: str, relation_property: str = None, limit: i
     else:
         # Query for any relation
         sparql_query = f"""
+        # Find related entities: Apply LIMIT before fetching labels.
         SELECT ?relation ?relationLabel ?related ?relatedLabel
         WHERE {{
-          wd:{entity_id} ?p ?related.
-          ?property wikibase:directClaim ?p.
-          BIND(?property as ?relation)
-          
-          # Filter out some common non-entity relations
-          FILTER(STRSTARTS(STR(?related), "http://www.wikidata.org/entity/"))
-          
+          {{
+            SELECT ?relation ?related
+            WHERE {{
+              wd:{entity_id} ?p ?related.
+              ?property wikibase:directClaim ?p.
+              BIND(?property as ?relation)
+              # Ensure ?related is a Wikidata entity
+              FILTER(STRSTARTS(STR(?related), "http://www.wikidata.org/entity/"))
+            }}
+            LIMIT {limit}
+          }}
           SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
         }}
-        LIMIT {limit}
         """
     
-    # Get related entities using the execute_sparql function
-    related_entities = execute_sparql(sparql_query)
+    # Get related entities using the tool's execute_wikidata_sparql for robust error handling
+    related_entities_json_str = execute_wikidata_sparql(sparql_query)
+
+    try:
+        # Attempt to parse to ensure it's valid JSON, but return the string
+        # as execute_wikidata_sparql already formats errors or results correctly.
+        json.loads(related_entities_json_str)
+    except json.JSONDecodeError:
+        return json.dumps({
+            "error": "Failed to parse SPARQL result from internal call to execute_wikidata_sparql for related entities.",
+            "details": "The response was not valid JSON.",
+            "context": {"entity_id": entity_id, "relation_property": relation_property, "query": sparql_query},
+            "suggestion": "This indicates an internal issue with the server's SPARQL execution tool chain."
+        })
     
-    # Handle the result based on its type
-    if isinstance(related_entities, str):
-        # It's already a JSON string, return as is
-        return related_entities
-    else:
-        # It's a dictionary, convert to JSON string
-        try:
-            return json.dumps(related_entities)
-        except Exception as e:
-            return json.dumps({"error": f"Error serializing result: {str(e)}", "raw": str(related_entities)})
+    # Return the JSON string (which might be an error JSON from execute_wikidata_sparql or actual results)
+    return related_entities_json_str
 
 # ============= MCP RESOURCES =============
 
@@ -327,17 +622,22 @@ def sparql_examples_resource():
             {
                 "name": "Basic entity information",
                 "query": """
+                # Basic entity information: Subquery for labels after LIMIT.
                 SELECT ?property ?propertyLabel ?value ?valueLabel
                 WHERE {
-                  wd:Q937 ?p ?statement.  # Q937 = Albert Einstein
-                  ?statement ?ps ?value.
-                  
-                  ?property wikibase:claim ?p.
-                  ?property wikibase:statementProperty ?ps.
-                  
+                  {
+                    SELECT ?property ?value
+                    WHERE {
+                      wd:Q937 ?p ?statement.  # Q937 = Albert Einstein
+                      ?statement ?ps ?value.
+
+                      ?property wikibase:claim ?p.
+                      ?property wikibase:statementProperty ?ps.
+                    }
+                    LIMIT 10
+                  }
                   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
                 }
-                LIMIT 10
                 """
             },
             {
@@ -354,10 +654,12 @@ def sparql_examples_resource():
             {
                 "name": "Find books by an author",
                 "query": """
+                # Find books by an author: Prioritize specific author link before type check.
                 SELECT ?book ?bookLabel
                 WHERE {
                   ?book wdt:P50 wd:Q535.  # P50 = author, Q535 = Isaac Asimov
-                  ?book wdt:P31/wdt:P279* wd:Q571.  # P31 = instance of, P279 = subclass of, Q571 = book
+                  # Check if it's a book (instance of book or subclass of book)
+                  ?book wdt:P31/wdt:P279* wd:Q571.
                   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
                 }
                 """
@@ -376,11 +678,13 @@ def sparql_examples_resource():
             {
                 "name": "Find mountains higher than 8000m",
                 "query": """
+                # Find mountains higher than 8000m: Prioritize height filter before type check.
                 SELECT ?mountain ?mountainLabel ?height
                 WHERE {
-                  ?mountain wdt:P31/wdt:P279* wd:Q8502.  # P31 = instance of, P279 = subclass of, Q8502 = mountain
                   ?mountain wdt:P2044 ?height.  # P2044 = elevation above sea level
                   FILTER(?height > 8000)
+                  # Ensure it's a mountain (instance of mountain or subclass of mountain)
+                  ?mountain wdt:P31/wdt:P279* wd:Q8502.
                   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
                 }
                 ORDER BY DESC(?height)

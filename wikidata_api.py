@@ -6,6 +6,9 @@ This module provides functions for interacting with the Wikidata API and SPARQL 
 import json
 import requests
 import traceback
+import time
+from requests.exceptions import Timeout, ConnectionError
+from SPARQLWrapper.SPARQLExceptions import QueryBadFormed
 
 # Import SPARQLWrapper
 from SPARQLWrapper import SPARQLWrapper, JSON
@@ -136,17 +139,26 @@ def get_entity_properties(entity_id: str) -> list:
         A list of property-value pairs for the entity
     """
     sparql_query = f"""
+    # Fetches properties and their values for a given entity.
+    # Uses a subquery to get core data before fetching labels for efficiency.
     SELECT ?property ?propertyLabel ?value ?valueLabel
     WHERE {{
-      wd:{entity_id} ?p ?statement.
-      ?statement ?ps ?value.
-      
-      ?property wikibase:claim ?p.
-      ?property wikibase:statementProperty ?ps.
-      
+      {{
+        SELECT ?property ?value
+        WHERE {{
+          # Core query to get property-value pairs for the entity
+          wd:{entity_id} ?p ?statement. # ?p is the property predicate
+          ?statement ?ps ?value.      # ?ps is the property statement value predicate
+
+          # Link predicates to actual property entities
+          ?property wikibase:claim ?p.
+          ?property wikibase:statementProperty ?ps.
+        }}
+        LIMIT 50
+      }}
+      # Apply labels to the results of the subquery
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
     }}
-    LIMIT 50
     """
     
     return json.loads(execute_sparql(sparql_query))
@@ -161,40 +173,83 @@ def execute_sparql(sparql_query: str) -> str:
     Returns:
         JSON-formatted result of the query
     """
-    try:
-        sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
-        sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
+    MAX_RETRIES = 3
+    INITIAL_BACKOFF = 1  # seconds
+
+    backoff_time = INITIAL_BACKOFF
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
+            sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
+
+            # Add common prefixes to make queries easier to write
+            prefixes = """
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX p: <http://www.wikidata.org/prop/>
+            PREFIX ps: <http://www.wikidata.org/prop/statement/>
+            PREFIX wikibase: <http://wikiba.se/ontology#>
+            PREFIX bd: <http://www.bigdata.com/rdf#>
+            """
+
+            # Add prefixes if they're not already in the query
+            if not any(prefix in sparql_query for prefix in ["PREFIX", "prefix"]):
+                full_query = prefixes + sparql_query
+            else:
+                full_query = sparql_query
+
+            sparql.setQuery(full_query)
+            sparql.setReturnFormat(JSON)
+
+            results = sparql.query().convert()
+            # Return the full results structure, not just the bindings
+            return json.dumps(results)
         
-        # Add common prefixes to make queries easier to write
-        prefixes = """
-        PREFIX wd: <http://www.wikidata.org/entity/>
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX p: <http://www.wikidata.org/prop/>
-        PREFIX ps: <http://www.wikidata.org/prop/statement/>
-        PREFIX wikibase: <http://wikiba.se/ontology#>
-        PREFIX bd: <http://www.bigdata.com/rdf#>
-        """
+        except (Timeout, ConnectionError) as e:
+            error_details = {
+                "error": f"Error executing query (attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
+                "query": sparql_query,
+                "error_type": str(type(e).__name__),
+                "traceback": traceback.format_exc()
+            }
+            print(f"SPARQL Error Details: {json.dumps(error_details, indent=2)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(backoff_time)
+                backoff_time *= 2  # Exponential backoff
+            else:
+                return json.dumps(error_details) # Max retries reached
         
-        # Add prefixes if they're not already in the query
-        if not any(prefix in sparql_query for prefix in ["PREFIX", "prefix"]):
-            full_query = prefixes + sparql_query
-        else:
-            full_query = sparql_query
-        
-        sparql.setQuery(full_query)
-        sparql.setReturnFormat(JSON)
-        
-        results = sparql.query().convert()
-        # Return the full results structure, not just the bindings
-        return json.dumps(results)
-    except Exception as e:
-        error_details = {
-            "error": f"Error executing query: {str(e)}",
-            "query": sparql_query,
-            "error_type": str(type(e).__name__),
-            "traceback": traceback.format_exc()
-        }
-        print(f"SPARQL Error Details: {json.dumps(error_details, indent=2)}")
-        return json.dumps(error_details)
+        except QueryBadFormed as e:
+            error_details = {
+                "error": f"SPARQL Query Syntax Error: {str(e)}",
+                "query": sparql_query,
+                "error_type": str(type(e).__name__),
+                "traceback": traceback.format_exc()
+            }
+            print(f"SPARQL Error Details: {json.dumps(error_details, indent=2)}")
+            return json.dumps(error_details) # Return immediately for bad query syntax
+
+        except Exception as e:
+            error_details = {
+                "error": f"An unexpected error occurred (attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
+                "query": sparql_query,
+                "error_type": str(type(e).__name__),
+                "traceback": traceback.format_exc()
+            }
+            print(f"SPARQL Error Details: {json.dumps(error_details, indent=2)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(backoff_time)
+                backoff_time *= 2  # Exponential backoff
+            else:
+                return json.dumps(error_details) # Max retries reached
+
+    # This part should ideally not be reached if logic is correct, but as a fallback:
+    final_error_details = {
+        "error": "Max retries reached. Failed to execute SPARQL query.",
+        "query": sparql_query,
+        "error_type": "MaxRetriesExceeded"
+    }
+    return json.dumps(final_error_details)
 
 
