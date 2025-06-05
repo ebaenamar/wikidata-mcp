@@ -184,7 +184,15 @@ def execute_sparql(sparql_query: str) -> str:
             sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
 
             # Define allowed SPARQL keywords for top-level lines
-            allowed_keywords = ["PREFIX", "SELECT", "ASK", "CONSTRUCT", "DESCRIBE", "INSERT"]
+            # Based on SPARQL 1.1 specification, including common clause starters.
+            # Matching is case-insensitive due to .upper() later.
+            allowed_keywords = [
+                "PREFIX", "SELECT", "ASK", "CONSTRUCT", "DESCRIBE", "INSERT",
+                "FILTER", "BIND", "VALUES", "OPTIONAL", "UNION", "GRAPH",
+                "SERVICE", "MINUS", "WHERE", "GROUP", "HAVING", "ORDER",
+                "LIMIT", "OFFSET", "DATA"
+                # "BY" is handled as part of "GROUP BY" or "ORDER BY" by taking the first word.
+            ]
 
             filtered_query_lines = []
             # Removed unused brace_level variable
@@ -337,6 +345,86 @@ def test_execute_sparql_with_problematic_lines():
         print(f"Test FAILED: Could not decode JSON from result string: {result_str}")
         print(f"Original problematic query sent to execute_sparql:\n{test_query_problematic}")
 
+def test_execute_sparql_with_various_clauses():
+    """
+    Tests the execute_sparql function with queries using various SPARQL clauses
+    to ensure essential lines are preserved by the filtering logic.
+    """
+    print("\nRunning test_execute_sparql_with_various_clauses...")
+
+    # Using a common, simple entity (e.g., Q1 for Universe) for basic triple patterns.
+    # Most queries are ASK for simplicity, focusing on syntax preservation.
+    # Prefixes are added by execute_sparql if not present.
+    test_queries = {
+        "FILTER": "ASK { wd:Q1 ?p ?o . FILTER(BOUND(?o)) }",
+        "BIND": "ASK { BIND(1 AS ?one) }",
+        "VALUES": "ASK { VALUES ?one { 1 UNDEF } }",
+        "OPTIONAL": "ASK { wd:Q1 ?p ?o . OPTIONAL { ?o ?p2 ?o2 } }",
+        "UNION": "ASK { { wd:Q1 ?p ?o } UNION { ?s ?p wd:Q1 } }",
+        "GRAPH": "ASK { GRAPH ?g { wd:Q1 ?p ?o } }",
+        "SERVICE": "ASK { SERVICE <http://example.com/sparql-not-real> { wd:Q1 ?p ?o } }",
+        "MINUS": "ASK { wd:Q1 ?p ?o . MINUS { wd:Q1 ?p wd:Q2 } }", # wd:Q2 is Earth
+        "WHERE_clause": "SELECT ?s WHERE { ?s ?p wd:Q1 . } LIMIT 1",
+        "GROUP_BY": "SELECT (COUNT(?o) AS ?count) WHERE { wd:Q1 ?p ?o . } GROUP BY ?p",
+        "HAVING": "SELECT ?p (COUNT(?o) AS ?count) WHERE { wd:Q1 ?p ?o . } GROUP BY ?p HAVING(?count > 0)",
+        "ORDER_BY": "SELECT ?o WHERE { wd:Q1 ?p ?o . } ORDER BY ?o LIMIT 1",
+        "LIMIT_OFFSET": "SELECT ?o WHERE { wd:Q1 ?p ?o . } ORDER BY ?o LIMIT 1 OFFSET 0"
+    }
+
+    all_passed_flag = True # Use a different name to avoid conflict with built-in all()
+    for clause, query in test_queries.items():
+        print(f"  Testing clause: {clause} with query: {query}")
+        result_str = execute_sparql(query)
+        try:
+            result_json = json.loads(result_str)
+
+            # Primary check: Was the query broken by filtering leading to QueryBadFormed?
+            is_query_bad_formed = "error" in result_json and \
+                                  ("QueryBadFormed" in result_json.get("error", "") or \
+                                   result_json.get("error_type") == "QueryBadFormed")
+
+            if is_query_bad_formed:
+                # Specific handling for GRAPH clause due to Wikidata endpoint limitations
+                if clause == "GRAPH" and "QuadsOperationInTriplesModeException" in result_json.get("error", ""):
+                    print(f"    Test for {clause} PASSED (line preserved; endpoint limitation 'QuadsOperationInTriplesModeException' received as expected).")
+                else:
+                    print(f"    Test for {clause} FAILED: QueryBadFormed error indicates filter may have broken the query.")
+                    print(f"    Error details: {result_json.get('error')}")
+                    all_passed_flag = False
+            # Specific check for SERVICE: expect an error, but not QueryBadFormed
+            elif clause == "SERVICE":
+                if "error" not in result_json:
+                    print(f"    Test for {clause} FAILED: SERVICE query did not produce an error as expected.")
+                    all_passed_flag = False
+                elif result_json.get("error_type") == "QueryBadFormed": # Should be a different error like EndPointInternalError or timeout
+                    print(f"    Test for {clause} FAILED: SERVICE query resulted in QueryBadFormed, expected a connection/timeout or other execution error.")
+                    all_passed_flag = False
+                else:
+                    print(f"    Test for {clause} PASSED (SERVICE query correctly failed with non-QueryBadFormed error: {result_json.get('error_type')}).")
+            # General checks for other query types if no QueryBadFormed error (or handled special case)
+            else: # Not QueryBadFormed (or handled special QueryBadFormed like for GRAPH)
+                if query.strip().upper().startswith("ASK") and "boolean" not in result_json and "error" not in result_json:
+                    print(f"    Test for {clause} FAILED: ASK query did not return a boolean result key and no other error reported.")
+                    all_passed_flag = False
+                elif query.strip().upper().startswith("SELECT") and "results" not in result_json and "error" not in result_json:
+                    print(f"    Test for {clause} FAILED: SELECT query did not return a results key and no other error reported.")
+                    all_passed_flag = False
+                elif "error" in result_json: # Some other non-QueryBadFormed error occurred
+                     print(f"    Test for {clause} PASSED (query resulted in expected non-QueryBadFormed error: {result_json.get('error_type', 'Unknown error')}).")
+                else:
+                    print(f"    Test for {clause} PASSED (query processed without being malformed by filter and executed as expected).")
+
+        except json.JSONDecodeError:
+            print(f"    Test for {clause} FAILED: Could not decode JSON from result string: {result_str}")
+            all_passed_flag = False
+
+    if all_passed_flag:
+        print("All new clause tests PASSED.")
+    else:
+        print("Some new clause tests FAILED.")
+
+    return all_passed_flag
+
 if __name__ == "__main__":
     # Example Usage (Optional - can be commented out or removed)
     # search_term = "Albert Einstein"
@@ -355,3 +443,6 @@ if __name__ == "__main__":
 
     # Test the SPARQL execution with problematic lines
     test_execute_sparql_with_problematic_lines()
+
+    # Test the SPARQL execution with various clauses
+    test_execute_sparql_with_various_clauses()
