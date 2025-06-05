@@ -183,6 +183,39 @@ def execute_sparql(sparql_query: str) -> str:
             sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
             sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
 
+            # Define allowed SPARQL keywords for top-level lines
+            allowed_keywords = ["PREFIX", "SELECT", "ASK", "CONSTRUCT", "DESCRIBE", "INSERT"]
+
+            filtered_query_lines = []
+            # Removed unused brace_level variable
+            for line_content in sparql_query.splitlines(): # Removed line_num as it's unused
+                stripped_line = line_content.strip()
+
+                # Skip blank lines and full-line comments
+                if stripped_line == "" or stripped_line.startswith("#"):
+                    continue
+
+                first_word_upper = stripped_line.upper().split(" ", 1)[0]
+
+                # Heuristic to identify likely triple patterns or other valid internal lines:
+                # Check for common prefixes, variables (?), and if it ends with a period.
+                # This is an attempt to distinguish "wd:Q42 ?p ?o ." from "Some junk text."
+                is_likely_triple_pattern = (
+                    ("wd:" in stripped_line or "wdt:" in stripped_line or "rdf:" in stripped_line or
+                     ":" in stripped_line or "?" in stripped_line) and
+                    stripped_line.endswith(".")
+                )
+
+                if first_word_upper in allowed_keywords:
+                    filtered_query_lines.append(line_content)
+                elif any(c in stripped_line for c in ['{', '}', ';', ',']): # Structural chars
+                    filtered_query_lines.append(line_content)
+                elif is_likely_triple_pattern:
+                    filtered_query_lines.append(line_content)
+                # else, it's a line like "This is not a valid statement" - drop it.
+
+            processed_query = "\n".join(filtered_query_lines)
+
             # Add common prefixes to make queries easier to write
             prefixes = """
             PREFIX wd: <http://www.wikidata.org/entity/>
@@ -193,11 +226,19 @@ def execute_sparql(sparql_query: str) -> str:
             PREFIX bd: <http://www.bigdata.com/rdf#>
             """
 
-            # Add prefixes if they're not already in the query
-            if not any(prefix in sparql_query for prefix in ["PREFIX", "prefix"]):
-                full_query = prefixes + sparql_query
+            # Add prefixes if they're not already in the processed_query
+            # and if the processed_query doesn't already start with "PREFIX" (case-insensitive)
+            # Also check if processed_query actually contains any non-prefix lines.
+            # If the query after filtering ONLY contains PREFIX lines, don't add more.
+
+            # Check if there are any non-PREFIX lines in the filtered query
+            has_non_prefix_lines = any(not line.strip().upper().startswith("PREFIX") for line in filtered_query_lines if line.strip())
+
+            if processed_query and has_non_prefix_lines and \
+               not any(line.strip().upper().startswith("PREFIX") for line in filtered_query_lines if line.strip().upper().startswith("PREFIX")):
+                full_query = prefixes.strip() + "\n" + processed_query
             else:
-                full_query = sparql_query
+                full_query = processed_query
 
             sparql.setQuery(full_query)
             sparql.setReturnFormat(JSON)
@@ -253,3 +294,64 @@ def execute_sparql(sparql_query: str) -> str:
     return json.dumps(final_error_details)
 
 
+def test_execute_sparql_with_problematic_lines():
+    """
+    Tests the execute_sparql function with a query containing lines that should be filtered out.
+    """
+    print("Running test_execute_sparql_with_problematic_lines...")
+
+    # This query includes comments and non-SPARQL lines that should be filtered.
+    # The core is a valid ASK query.
+    test_query_problematic = """
+    # This is a comment line that should be removed.
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    This line is not a valid SPARQL statement.
+    ASK WHERE {
+      wd:Q42 ?p ?o . # Q42 is Douglas Adams, should exist.
+    }
+    Another bogus line here.
+    """
+
+    expected_result_ask_true = {"head": {}, "boolean": True}
+
+    result_str = execute_sparql(test_query_problematic)
+
+    try:
+        result_json = json.loads(result_str)
+        # We need to compare the boolean value for ASK queries
+        if "boolean" in result_json:
+            if result_json["boolean"] == expected_result_ask_true["boolean"]:
+                print("Test PASSED: Problematic lines were filtered, and the ASK query returned True as expected.")
+            else:
+                print(f"Test FAILED: ASK query returned {result_json['boolean']}, expected {expected_result_ask_true['boolean']}.")
+                print(f"Full result: {result_json}")
+        elif "error" in result_json:
+            print(f"Test FAILED: Query execution resulted in an error: {result_json['error']}")
+            if "query" in result_json:
+                 print(f"Original problematic query sent to execute_sparql:\n{test_query_problematic}")
+        else:
+            print(f"Test FAILED: Unexpected result format. Result: {result_json}")
+
+    except json.JSONDecodeError:
+        print(f"Test FAILED: Could not decode JSON from result string: {result_str}")
+        print(f"Original problematic query sent to execute_sparql:\n{test_query_problematic}")
+
+if __name__ == "__main__":
+    # Example Usage (Optional - can be commented out or removed)
+    # search_term = "Albert Einstein"
+    # entity_id = search_entity(search_term)
+    # print(f"Entity ID for '{search_term}': {entity_id}")
+
+    # if not entity_id.startswith("Error") and entity_id != "No entity found":
+    #     metadata = get_entity_metadata(entity_id)
+    #     print(f"Metadata for {entity_id}: {json.dumps(metadata, indent=2)}")
+
+    #     properties = get_entity_properties(entity_id)
+    #     # Properties are already a list of dicts from the new function
+    #     print(f"Properties for {entity_id}:")
+    #     for prop in properties: # Assuming properties is already a list from json.loads
+    #         print(json.dumps(prop, indent=2))
+
+    # Test the SPARQL execution with problematic lines
+    test_execute_sparql_with_problematic_lines()
